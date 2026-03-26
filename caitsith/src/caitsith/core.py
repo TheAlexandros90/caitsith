@@ -76,6 +76,56 @@ class CaitSith:
             errors=parse_errors,
         )
 
+    def _to_numeric_series(
+        self,
+        column: str,
+        errors: Optional[Literal["raise", "coerce"]] = None,
+    ) -> pd.Series:
+        self._validate_column(column)
+
+        mode = errors if errors is not None else self.errors
+        parse_errors = "raise" if mode == "raise" else "coerce"
+        return pd.to_numeric(self.df[column], errors=parse_errors)
+
+    def _build_criteria_mask(self, series: pd.Series, criteria: Union[str, int, float, bool, None]) -> pd.Series:
+        if isinstance(criteria, str):
+            for operator in (">=", "<=", "<>", ">", "<", "="):
+                if criteria.startswith(operator):
+                    raw_value = criteria[len(operator):].strip()
+                    raw_lower = raw_value.lower()
+
+                    if raw_lower in {"", "nan", "na", "none", "null", "blank", "blanco"}:
+                        if operator in {"=", "=="}:
+                            return series.isna()
+                        if operator == "<>":
+                            return series.notna()
+
+                    if pd.api.types.is_datetime64_any_dtype(series):
+                        parsed_value = pd.to_datetime(raw_value, errors="coerce")
+                        if pd.isna(parsed_value):
+                            parsed_value = raw_value
+                    else:
+                        parsed_value = pd.to_numeric(pd.Series([raw_value]), errors="coerce").iloc[0]
+                        if pd.isna(parsed_value):
+                            parsed_value = raw_value
+
+                    if operator == ">=":
+                        return series >= parsed_value
+                    if operator == "<=":
+                        return series <= parsed_value
+                    if operator == ">":
+                        return series > parsed_value
+                    if operator == "<":
+                        return series < parsed_value
+                    if operator in {"=", "=="}:
+                        return series == parsed_value
+                    if operator == "<>":
+                        return series != parsed_value
+
+        if criteria is None or (isinstance(criteria, float) and pd.isna(criteria)):
+            return series.isna()
+        return series == criteria
+
     def _normalize_holidays(self, holidays: Optional[List[Union[str, pd.Timestamp]]]) -> Optional[np.ndarray]:
         if holidays is None:
             return None
@@ -759,6 +809,52 @@ class CaitSith:
         self._validate_column(column)
         self.df[new_column_name] = self.df[column].astype(str).str.replace(r"[\x00-\x1F\x7F]", "", regex=True)
 
+    def texto_unir(self, delimiter: str, columns: List[str], new_column_name: str, ignore_empty: bool = True) -> None:
+        """
+        Une varias columnas de texto con un separador, similar a TEXTJOIN de Excel.
+        """
+        self._validate_columns(columns)
+
+        values = self.df[columns]
+
+        def join_row(row: pd.Series) -> str:
+            parts = row.tolist()
+            if ignore_empty:
+                parts = [part for part in parts if pd.notna(part) and str(part) != ""]
+            else:
+                parts = ["" if pd.isna(part) else part for part in parts]
+            return delimiter.join(str(part) for part in parts)
+
+        self.df[new_column_name] = values.apply(join_row, axis=1)
+
+    def exacto(
+        self,
+        left_value: Union[str, int, float, Callable, pd.Series],
+        right_value: Union[str, int, float, Callable, pd.Series],
+        new_column_name: str,
+        errors: Optional[Literal["raise", "coerce"]] = None,
+    ) -> None:
+        """
+        Compara dos valores/textos de forma exacta, similar a EXACT de Excel.
+        """
+        try:
+            left_series = self._resolve_conditional_value(left_value)
+            right_series = self._resolve_conditional_value(right_value)
+            self.df[new_column_name] = left_series.astype(str).eq(right_series.astype(str))
+        except Exception as error:
+            self._handle_error(error, errors)
+            self.df[new_column_name] = False
+
+    def secuencia(self, inicio: Union[int, float], filas: int, new_column_name: str, paso: Union[int, float] = 1) -> None:
+        """
+        Genera una secuencia lineal, similar a SEQUENCE de Excel en formato columna.
+        """
+        if filas <= 0:
+            raise ValueError("'filas' debe ser mayor que 0.")
+        values = [inicio + i * paso for i in range(filas)]
+        series = pd.Series(values, index=self.df.index[:filas])
+        self.df[new_column_name] = series.reindex(self.df.index)
+
     def si(self, conditions: List[Tuple[str, str, Union[str, int, float]]], true_value: Union[str, int, float, Callable, pd.Series], false_value: Union[str, int, float, Callable, pd.Series], new_column_name: str, all_conditions: bool = True, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
         """
         Aplica una lógica condicional tipo SI (IF) a las filas del DataFrame y agrega una nueva columna con los resultados.
@@ -1387,6 +1483,22 @@ class CaitSith:
         self.df = self.df.sort_values(by=columns_list, ascending=ascending)
         if reset_index:
             self.df = self.df.reset_index(drop=True)
+
+    def ordenar(self, columns: Union[str, List[str]], ascending: Union[bool, List[bool]] = True) -> pd.DataFrame:
+        """
+        Devuelve una copia ordenada del DataFrame, similar a SORT de Excel.
+        """
+        columns_list = self._as_column_list(columns)
+        self._validate_columns(columns_list)
+        return self.df.sort_values(by=columns_list, ascending=ascending).copy()
+
+    def unicos(self, columns: Union[str, List[str]]) -> pd.DataFrame:
+        """
+        Devuelve una copia con valores únicos, similar a UNIQUE de Excel.
+        """
+        columns_list = self._as_column_list(columns)
+        self._validate_columns(columns_list)
+        return self.df[columns_list].drop_duplicates().reset_index(drop=True)
 
     def renombrar_columnas(self, rename_map: dict) -> None:
         """
@@ -2342,6 +2454,48 @@ class CaitSith:
 
         self.df[new_column_name] = self.df[column].apply(to_default_if_error)
 
+    def si_na(self, column: str, new_column_name: str, default_value: Union[str, int, float] = np.nan) -> None:
+        """
+        Sustituye valores nulos/NaN por un valor por defecto, similar a IFNA.
+        """
+        self._validate_column(column)
+        self.df[new_column_name] = self.df[column].where(self.df[column].notna(), default_value)
+
+    def valor(self, column: str, new_column_name: str, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        """
+        Convierte texto a número, similar a VALUE de Excel.
+        """
+        self._validate_column(column)
+        mode = errors if errors is not None else self.errors
+        parse_errors = "raise" if mode == "raise" else "coerce"
+        self.df[new_column_name] = pd.to_numeric(self.df[column], errors=parse_errors)
+
+    def elegir(
+        self,
+        index_value: Union[str, int, Callable, pd.Series],
+        options: List[Union[str, int, float, Callable, pd.Series]],
+        new_column_name: str,
+        errors: Optional[Literal["raise", "coerce"]] = None,
+    ) -> None:
+        """
+        Devuelve una opción según un índice 1-based, similar a CHOOSE de Excel.
+        """
+        if not options:
+            raise ValueError("'options' no puede estar vacío.")
+
+        try:
+            index_series = self._resolve_conditional_value(index_value)
+            option_series = [self._resolve_conditional_value(option) for option in options]
+
+            result = pd.Series(np.nan, index=self.df.index, dtype="object")
+            for idx, series in enumerate(option_series, start=1):
+                result = pd.Series(np.where(index_series == idx, series, result), index=self.df.index)
+
+            self.df[new_column_name] = result
+        except Exception as error:
+            self._handle_error(error, errors)
+            self.df[new_column_name] = np.nan
+
     # Cuenta valores numéricos (CONTAR)
     def contar(self, column: str, new_column_name: str) -> None:
         self._validate_column(column)
@@ -2540,3 +2694,514 @@ class CaitSith:
     def raiz(self, column: str, new_column_name: str) -> None:
         self._validate_column(column)
         self.df[new_column_name] = self.df[column].apply(lambda x: np.sqrt(x) if pd.notnull(x) else x)
+
+    # Máximo por fila entre columnas (MAX)
+    def maximo(self, columns: Union[str, List[str]], new_column_name: str) -> None:
+        columns = self._as_column_list(columns)
+        self._validate_columns(columns)
+        self.df[new_column_name] = self.df[columns].max(axis=1)
+
+    # Mínimo por fila entre columnas (MIN)
+    def minimo(self, columns: Union[str, List[str]], new_column_name: str) -> None:
+        columns = self._as_column_list(columns)
+        self._validate_columns(columns)
+        self.df[new_column_name] = self.df[columns].min(axis=1)
+
+    # Producto por fila entre columnas (PRODUCTO)
+    def producto(self, columns: Union[str, List[str]], new_column_name: str, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        columns = self._as_column_list(columns)
+        self._validate_columns(columns)
+
+        mode = errors if errors is not None else self.errors
+        parse_errors = "raise" if mode == "raise" else "coerce"
+        numeric_df = self.df[columns].apply(lambda serie: pd.to_numeric(serie, errors=parse_errors))
+        self.df[new_column_name] = numeric_df.prod(axis=1)
+
+    # Suma acumulada (SUMA.ACUMULADA)
+    def suma_acumulada(self, column: str, new_column_name: str, skipna: bool = True, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        numeric_series = self._to_numeric_series(column, errors=errors)
+        self.df[new_column_name] = numeric_series.cumsum(skipna=skipna)
+
+    # Producto acumulado (PRODUCTO.ACUMULADO)
+    def producto_acumulado(self, column: str, new_column_name: str, skipna: bool = True, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        numeric_series = self._to_numeric_series(column, errors=errors)
+        self.df[new_column_name] = numeric_series.cumprod(skipna=skipna)
+
+    # Contar celdas en blanco por fila (CONTAR.BLANCO)
+    def contar_blancos(self, columns: Union[str, List[str]], new_column_name: str) -> None:
+        columns = self._as_column_list(columns)
+        self._validate_columns(columns)
+        self.df[new_column_name] = self.df[columns].isna().sum(axis=1)
+
+    # Contar celdas no vacías por fila (CONTARA.POR.FILA)
+    def contar_no_blancos(self, columns: Union[str, List[str]], new_column_name: str) -> None:
+        columns = self._as_column_list(columns)
+        self._validate_columns(columns)
+        self.df[new_column_name] = self.df[columns].notna().sum(axis=1)
+
+    # Texto antes de un delimitador (TEXTBEFORE)
+    def texto_antes(
+        self,
+        column: str,
+        delimiter: str,
+        new_column_name: str,
+        instance_num: int = 1,
+        if_not_found: Union[str, int, float] = np.nan,
+    ) -> None:
+        self._validate_column(column)
+        if not isinstance(delimiter, str) or delimiter == "":
+            raise ValueError("'delimiter' debe ser un texto no vacío.")
+        if instance_num < 1:
+            raise ValueError("'instance_num' debe ser mayor o igual que 1.")
+
+        def extraer_antes(value):
+            if pd.isna(value):
+                return np.nan
+
+            text = str(value)
+            start = 0
+            position = -1
+
+            for _ in range(instance_num):
+                position = text.find(delimiter, start)
+                if position == -1:
+                    return if_not_found
+                start = position + len(delimiter)
+
+            return text[:position]
+
+        self.df[new_column_name] = self.df[column].apply(extraer_antes)
+
+    # Texto después de un delimitador (TEXTAFTER)
+    def texto_despues(
+        self,
+        column: str,
+        delimiter: str,
+        new_column_name: str,
+        instance_num: int = 1,
+        if_not_found: Union[str, int, float] = np.nan,
+    ) -> None:
+        self._validate_column(column)
+        if not isinstance(delimiter, str) or delimiter == "":
+            raise ValueError("'delimiter' debe ser un texto no vacío.")
+        if instance_num < 1:
+            raise ValueError("'instance_num' debe ser mayor o igual que 1.")
+
+        def extraer_despues(value):
+            if pd.isna(value):
+                return np.nan
+
+            text = str(value)
+            start = 0
+            position = -1
+
+            for _ in range(instance_num):
+                position = text.find(delimiter, start)
+                if position == -1:
+                    return if_not_found
+                start = position + len(delimiter)
+
+            return text[start:]
+
+        self.df[new_column_name] = self.df[column].apply(extraer_despues)
+
+    # Texto entre dos delimitadores (TEXTBETWEEN)
+    def texto_entre(
+        self,
+        column: str,
+        start_delimiter: str,
+        end_delimiter: str,
+        new_column_name: str,
+        if_not_found: Union[str, int, float] = np.nan,
+    ) -> None:
+        self._validate_column(column)
+        if not isinstance(start_delimiter, str) or start_delimiter == "":
+            raise ValueError("'start_delimiter' debe ser un texto no vacío.")
+        if not isinstance(end_delimiter, str) or end_delimiter == "":
+            raise ValueError("'end_delimiter' debe ser un texto no vacío.")
+
+        def extraer_entre_delimitadores(value):
+            if pd.isna(value):
+                return np.nan
+
+            text = str(value)
+            start = text.find(start_delimiter)
+            if start == -1:
+                return if_not_found
+
+            start += len(start_delimiter)
+            end = text.find(end_delimiter, start)
+            if end == -1:
+                return if_not_found
+
+            return text[start:end]
+
+        self.df[new_column_name] = self.df[column].apply(extraer_entre_delimitadores)
+
+    # Signo numérico (SIGNO)
+    def signo(self, column: str, new_column_name: str, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        numeric_series = self._to_numeric_series(column, errors=errors)
+        self.df[new_column_name] = np.sign(numeric_series)
+
+    # Redondeo al múltiplo más cercano (MROUND)
+    def redondear_multiplo(
+        self,
+        column: str,
+        multiple: Union[int, float],
+        new_column_name: str,
+        errors: Optional[Literal["raise", "coerce"]] = None,
+    ) -> None:
+        if multiple == 0:
+            raise ValueError("'multiple' no puede ser 0.")
+
+        numeric_series = self._to_numeric_series(column, errors=errors)
+        self.df[new_column_name] = np.round(numeric_series / multiple) * multiple
+
+    # CONTAR.SI con criterio estilo Excel
+    def contar_si_criterio_agg(self, column: str, criteria: Union[str, int, float, bool, None]) -> int:
+        self._validate_column(column)
+        mask = self._build_criteria_mask(self.df[column], criteria)
+        return int(mask.sum())
+
+    def contar_si_criterio_col(self, column: str, criteria: Union[str, int, float, bool, None], new_column_name: str) -> None:
+        self.df[new_column_name] = self.contar_si_criterio_agg(column, criteria)
+
+    def contar_si_criterio(self, column: str, criteria: Union[str, int, float, bool, None]) -> int:
+        return self.contar_si_criterio_agg(column, criteria)
+
+    # SUMAR.SI con criterio estilo Excel
+    def sumar_si_criterio_agg(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        sum_columns: Union[str, List[str]],
+    ) -> float:
+        self._validate_column(condition_column)
+        sum_columns_list = self._as_column_list(sum_columns)
+        self._validate_columns(sum_columns_list)
+
+        mask = self._build_criteria_mask(self.df[condition_column], criteria)
+        row_sum = self.df[sum_columns_list].sum(axis=1)
+        return float(row_sum[mask].sum())
+
+    def sumar_si_criterio_col(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        sum_columns: Union[str, List[str]],
+        new_column_name: str,
+    ) -> None:
+        self.df[new_column_name] = self.sumar_si_criterio_agg(condition_column, criteria, sum_columns)
+
+    def sumar_si_criterio(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        sum_columns: Union[str, List[str]],
+    ) -> float:
+        return self.sumar_si_criterio_agg(condition_column, criteria, sum_columns)
+
+    # PROMEDIO.SI con criterio estilo Excel
+    def promedio_si_criterio_agg(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        target_column: str,
+    ) -> float:
+        self._validate_columns([condition_column, target_column])
+        mask = self._build_criteria_mask(self.df[condition_column], criteria)
+        filtered = self.df.loc[mask, target_column]
+        return float(np.nan) if filtered.empty else float(filtered.mean())
+
+    def promedio_si_criterio_col(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        target_column: str,
+        new_column_name: str,
+    ) -> None:
+        self.df[new_column_name] = self.promedio_si_criterio_agg(condition_column, criteria, target_column)
+
+    def promedio_si_criterio(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        target_column: str,
+    ) -> float:
+        return self.promedio_si_criterio_agg(condition_column, criteria, target_column)
+
+    # MAX.SI / MIN.SI con criterio estilo Excel
+    def max_si_criterio_agg(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        target_column: str,
+    ) -> Union[int, float]:
+        self._validate_columns([condition_column, target_column])
+        mask = self._build_criteria_mask(self.df[condition_column], criteria)
+        filtered = self.df.loc[mask, target_column]
+        return np.nan if filtered.empty else filtered.max()
+
+    def min_si_criterio_agg(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        target_column: str,
+    ) -> Union[int, float]:
+        self._validate_columns([condition_column, target_column])
+        mask = self._build_criteria_mask(self.df[condition_column], criteria)
+        filtered = self.df.loc[mask, target_column]
+        return np.nan if filtered.empty else filtered.min()
+
+    def max_si_criterio_col(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        target_column: str,
+        new_column_name: str,
+    ) -> None:
+        self.df[new_column_name] = self.max_si_criterio_agg(condition_column, criteria, target_column)
+
+    def min_si_criterio_col(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        target_column: str,
+        new_column_name: str,
+    ) -> None:
+        self.df[new_column_name] = self.min_si_criterio_agg(condition_column, criteria, target_column)
+
+    def max_si_criterio(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        target_column: str,
+    ) -> Union[int, float]:
+        return self.max_si_criterio_agg(condition_column, criteria, target_column)
+
+    def min_si_criterio(
+        self,
+        condition_column: str,
+        criteria: Union[str, int, float, bool, None],
+        target_column: str,
+    ) -> Union[int, float]:
+        return self.min_si_criterio_agg(condition_column, criteria, target_column)
+
+    # Reemplazo posicional de texto (REEMPLAZAR / REPLACE)
+    def reemplazar_posicion(
+        self,
+        column: str,
+        start: int,
+        num_chars: int,
+        new_text: str,
+        new_column_name: str,
+    ) -> None:
+        self._validate_column(column)
+        if start < 1:
+            raise ValueError("'start' debe ser mayor o igual que 1.")
+        if num_chars < 0:
+            raise ValueError("'num_chars' no puede ser negativo.")
+
+        start_index = start - 1
+        self.df[new_column_name] = self.df[column].astype(str).apply(
+            lambda text: text[:start_index] + new_text + text[start_index + num_chars:]
+        )
+
+    # Extraer texto con regex
+    def extraer_regex(self, column: str, pattern: str, new_column_name: str, group: int = 0) -> None:
+        self._validate_column(column)
+        if group < 0:
+            raise ValueError("'group' no puede ser negativo.")
+
+        compiled = re.compile(pattern)
+
+        def get_match(value):
+            if pd.isna(value):
+                return np.nan
+            match = compiled.search(str(value))
+            if match is None:
+                return np.nan
+            try:
+                return match.group(group)
+            except IndexError:
+                return np.nan
+
+        self.df[new_column_name] = self.df[column].apply(get_match)
+
+    # Contar ocurrencias de texto
+    def contar_ocurrencias(self, column: str, substring: str, new_column_name: str, case: bool = True) -> None:
+        self._validate_column(column)
+        if substring == "":
+            raise ValueError("'substring' no puede ser vacío.")
+
+        if case:
+            series = self.df[column].astype(str)
+            needle = substring
+        else:
+            series = self.df[column].astype(str).str.lower()
+            needle = substring.lower()
+
+        self.df[new_column_name] = series.str.count(re.escape(needle))
+
+    # Invertir texto
+    def invertir_texto(self, column: str, new_column_name: str) -> None:
+        self._validate_column(column)
+        self.df[new_column_name] = self.df[column].astype(str).str[::-1]
+
+    # Código ASCII/Unicode del primer carácter (CODE)
+    def codigo(self, column: str, new_column_name: str) -> None:
+        self._validate_column(column)
+
+        def to_code(value):
+            if pd.isna(value):
+                return np.nan
+            text = str(value)
+            return np.nan if text == "" else ord(text[0])
+
+        self.df[new_column_name] = self.df[column].apply(to_code)
+
+    # Carácter desde código numérico (CHAR)
+    def caracter(self, column: str, new_column_name: str, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        numeric_series = self._to_numeric_series(column, errors=errors)
+        mode = errors if errors is not None else self.errors
+
+        def to_char(value):
+            if pd.isna(value):
+                return np.nan
+            try:
+                return chr(int(value))
+            except (TypeError, ValueError, OverflowError) as error:
+                if mode == "raise":
+                    raise error
+                return np.nan
+
+        self.df[new_column_name] = numeric_series.apply(to_char)
+
+    # Relleno de texto por la izquierda/derecha
+    def rellenar_izquierda(self, column: str, width: int, fillchar: str, new_column_name: str) -> None:
+        self._validate_column(column)
+        if width < 0:
+            raise ValueError("'width' no puede ser negativo.")
+        if not isinstance(fillchar, str) or len(fillchar) != 1:
+            raise ValueError("'fillchar' debe ser un único carácter.")
+        self.df[new_column_name] = self.df[column].astype(str).str.pad(width, side="left", fillchar=fillchar)
+
+    def rellenar_derecha(self, column: str, width: int, fillchar: str, new_column_name: str) -> None:
+        self._validate_column(column)
+        if width < 0:
+            raise ValueError("'width' no puede ser negativo.")
+        if not isinstance(fillchar, str) or len(fillchar) != 1:
+            raise ValueError("'fillchar' debe ser un único carácter.")
+        self.df[new_column_name] = self.df[column].astype(str).str.pad(width, side="right", fillchar=fillchar)
+
+    # Operaciones avanzadas de fecha
+    def inicio_ano(self, column: str, new_column_name: str) -> None:
+        datetime_series = self._to_datetime_series(column)
+        self.df[new_column_name] = datetime_series.dt.to_period("Y").dt.start_time
+
+    def fin_ano(self, column: str, new_column_name: str) -> None:
+        datetime_series = self._to_datetime_series(column)
+        self.df[new_column_name] = datetime_series.dt.to_period("Y").dt.end_time.dt.normalize()
+
+    def dia_del_ano(self, column: str, new_column_name: str) -> None:
+        datetime_series = self._to_datetime_series(column)
+        self.df[new_column_name] = datetime_series.dt.dayofyear
+
+    def dias_en_mes(self, column: str, new_column_name: str) -> None:
+        datetime_series = self._to_datetime_series(column)
+        self.df[new_column_name] = datetime_series.dt.days_in_month
+
+    def sumar_meses(self, column: str, months: int, new_column_name: str) -> None:
+        datetime_series = self._to_datetime_series(column, errors="coerce")
+        offset = pd.DateOffset(months=months)
+        self.df[new_column_name] = datetime_series + offset
+
+    def sumar_anos(self, column: str, years: int, new_column_name: str) -> None:
+        datetime_series = self._to_datetime_series(column, errors="coerce")
+        offset = pd.DateOffset(years=years)
+        self.df[new_column_name] = datetime_series + offset
+
+    def edad_anos(self, birthdate_column: str, new_column_name: str, reference_date: Optional[Union[str, pd.Timestamp]] = None) -> None:
+        birthdates = self._to_datetime_series(birthdate_column, errors="coerce")
+        reference = pd.Timestamp.today().normalize() if reference_date is None else pd.Timestamp(reference_date)
+
+        ages = reference.year - birthdates.dt.year
+        before_birthday = (reference.month < birthdates.dt.month) | (
+            (reference.month == birthdates.dt.month) & (reference.day < birthdates.dt.day)
+        )
+        self.df[new_column_name] = (ages - before_birthday.astype("Int64")).where(birthdates.notna(), np.nan)
+
+    # Estadística avanzada
+    def correlacion(self, column_x: str, column_y: str, new_column_name: Optional[str] = None) -> float:
+        self._validate_columns([column_x, column_y])
+        result = float(self.df[column_x].corr(self.df[column_y]))
+        if new_column_name:
+            self.df[new_column_name] = result
+        return result
+
+    def covarianza_p(self, column_x: str, column_y: str, new_column_name: Optional[str] = None) -> float:
+        self._validate_columns([column_x, column_y])
+        result = float(self.df[[column_x, column_y]].cov(ddof=0).iloc[0, 1])
+        if new_column_name:
+            self.df[new_column_name] = result
+        return result
+
+    def covarianza_s(self, column_x: str, column_y: str, new_column_name: Optional[str] = None) -> float:
+        self._validate_columns([column_x, column_y])
+        result = float(self.df[[column_x, column_y]].cov(ddof=1).iloc[0, 1])
+        if new_column_name:
+            self.df[new_column_name] = result
+        return result
+
+    def cuartil(self, column: str, quart: int, new_column_name: Optional[str] = None) -> float:
+        self._validate_column(column)
+        quartile_map = {0: 0.0, 1: 0.25, 2: 0.5, 3: 0.75, 4: 1.0}
+        if quart not in quartile_map:
+            raise ValueError("'quart' debe ser 0, 1, 2, 3 o 4.")
+        result = float(self.df[column].quantile(quartile_map[quart]))
+        if new_column_name:
+            self.df[new_column_name] = result
+        return result
+
+    # Funciones matemáticas
+    def logaritmo(
+        self,
+        column: str,
+        new_column_name: str,
+        base: Union[int, float] = 10,
+        errors: Optional[Literal["raise", "coerce"]] = None,
+    ) -> None:
+        if base <= 0 or base == 1:
+            raise ValueError("'base' debe ser mayor que 0 y distinta de 1.")
+        numeric_series = self._to_numeric_series(column, errors=errors)
+        mode = errors if errors is not None else self.errors
+
+        def compute_log(value):
+            if pd.isna(value):
+                return np.nan
+            if value <= 0:
+                if mode == "raise":
+                    raise ValueError("El logaritmo solo está definido para valores mayores que 0.")
+                return np.nan
+            return np.log(value) / np.log(base)
+
+        self.df[new_column_name] = numeric_series.apply(compute_log)
+
+    def ln(self, column: str, new_column_name: str, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        self.logaritmo(column, new_column_name, base=np.e, errors=errors)
+
+    def exp(self, column: str, new_column_name: str, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        numeric_series = self._to_numeric_series(column, errors=errors)
+        self.df[new_column_name] = np.exp(numeric_series)
+
+    def seno(self, column: str, new_column_name: str, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        numeric_series = self._to_numeric_series(column, errors=errors)
+        self.df[new_column_name] = np.sin(numeric_series)
+
+    def coseno(self, column: str, new_column_name: str, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        numeric_series = self._to_numeric_series(column, errors=errors)
+        self.df[new_column_name] = np.cos(numeric_series)
+
+    def tangente(self, column: str, new_column_name: str, errors: Optional[Literal["raise", "coerce"]] = None) -> None:
+        numeric_series = self._to_numeric_series(column, errors=errors)
+        self.df[new_column_name] = np.tan(numeric_series)

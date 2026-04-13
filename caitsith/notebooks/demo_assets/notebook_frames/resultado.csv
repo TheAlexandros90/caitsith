@@ -1,0 +1,5 @@
+cliente,sku,familia,importe,coste,margen,segmento,ticket_promedio,cliente_pais,mes_operacion
+Ana,A1,Accesorios,120.0,70.0,50.0,alto,40.0,Ana | ES,4
+Luis,B2,Bundles,80.0,55.0,25.0,estandar,40.0,Luis | MX,4
+Ana,A1,Accesorios,150.0,90.0,60.0,alto,30.0,Ana | ES,4
+Marta,C3,Servicios,60.0,30.0,30.0,estandar,60.0,Marta | CO,4

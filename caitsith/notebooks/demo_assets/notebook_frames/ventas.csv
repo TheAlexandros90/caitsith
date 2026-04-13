@@ -1,0 +1,5 @@
+cliente,sku,importe,coste,unidades,precio_unitario,pais,fecha_operacion,Preuba
+Ana,A1,120.0,70.0,3,40.0,ES,2026-04-01,2
+Luis,B2,80.0,55.0,2,40.0,MX,2026-04-02,2
+Ana,A1,150.0,90.0,5,30.0,ES,2026-04-05,1
+Marta,C3,60.0,30.0,1,60.0,CO,2026-04-07,1
